@@ -1,14 +1,36 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { CheckCircle2, Circle, Plus, Trash2, Clock, Bell, Play, Pause, Square, Mail, BarChart3, Target, Briefcase, X, Timer, TrendingUp, Calendar, Zap, Download, Upload, FileJson } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getDatabase, ref, onValue, set, push, remove, update } from 'firebase/database';
+import { CheckCircle2, Circle, Plus, Trash2, Clock, Bell, Play, Pause, Square, BarChart3, Target, X, Timer, TrendingUp, Calendar, Zap, Download, Upload, FileJson, LogOut, Users } from 'lucide-react';
+
+// ⚠️ REPLACE WITH YOUR FIREBASE CONFIG ⚠️
+const firebaseConfig = {
+  apiKey: "AIzaSyCzy04TRJCtkj0seZFi0Y_LNbI-lL7soiw",
+  authDomain: "tracker-86772.firebaseapp.com",
+  databaseURL: "https://tracker-86772-default-rtdb.firebaseio.com",
+  projectId: "tracker-86772",
+  storageBucket: "tracker-86772.firebasestorage.app",
+  messagingSenderId: "345847463092",
+  appId: "1:345847463092:web:37fd2aa67b13a60cc8ebe1",
+  measurementId: "G-LL6SX4V950"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getDatabase(app);
+const googleProvider = new GoogleAuthProvider();
 
 export default function TaskTracker() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
   const [tasks, setTasks] = useState([]);
+  const [teamMembers, setTeamMembers] = useState([]);
   const [newTask, setNewTask] = useState('');
   const [category, setCategory] = useState('work');
   const [priority, setPriority] = useState('medium');
   const [dueDate, setDueDate] = useState('');
-  const [userName, setUserName] = useState('');
-  const [showNamePrompt, setShowNamePrompt] = useState(true);
   const [notifications, setNotifications] = useState([]);
   const [timerRunning, setTimerRunning] = useState(false);
   const [timerSeconds, setTimerSeconds] = useState(0);
@@ -18,24 +40,92 @@ export default function TaskTracker() {
   const [showStats, setShowStats] = useState(false);
   const [filter, setFilter] = useState('all');
   const [showDataModal, setShowDataModal] = useState(false);
+  const [showTeam, setShowTeam] = useState(false);
   const fileInputRef = useRef(null);
+  const prevTasksRef = useRef([]);
 
+  // Auth state listener
   useEffect(() => {
-    const savedName = localStorage.getItem('taskTrackerName');
-    if (savedName) {
-      setUserName(savedName);
-      setShowNamePrompt(false);
-    }
-    setDueDate(new Date().toISOString().split('T')[0]);
-    loadTasks();
-    const interval = setInterval(loadTasks, 3000);
-    return () => clearInterval(interval);
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setLoading(false);
+      if (currentUser) {
+        // Register user in team members
+        const userRef = ref(db, `team/${currentUser.uid}`);
+        set(userRef, {
+          uid: currentUser.uid,
+          name: currentUser.displayName,
+          email: currentUser.email,
+          photo: currentUser.photoURL,
+          lastSeen: Date.now()
+        });
+      }
+    });
+    return () => unsubscribe();
   }, []);
 
+  // Set default due date
   useEffect(() => {
-    if (userName) loadWorkSessions();
-  }, [userName]);
+    setDueDate(new Date().toISOString().split('T')[0]);
+  }, []);
 
+  // Listen to tasks in real-time
+  useEffect(() => {
+    if (!user) return;
+    
+    const tasksRef = ref(db, 'tasks');
+    const unsubscribe = onValue(tasksRef, (snapshot) => {
+      const data = snapshot.val();
+      const taskList = data ? Object.entries(data).map(([id, task]) => ({ id, ...task })) : [];
+      
+      // Check for new tasks or completions from other users
+      if (prevTasksRef.current.length > 0) {
+        const prevIds = new Set(prevTasksRef.current.map(t => t.id));
+        const newTasks = taskList.filter(t => !prevIds.has(t.id) && t.createdBy !== user.displayName);
+        newTasks.forEach(t => addNotif(`${t.createdBy} added: "${t.text}"`, 'info'));
+        
+        taskList.forEach(t => {
+          const prev = prevTasksRef.current.find(p => p.id === t.id);
+          if (prev && !prev.completed && t.completed && t.completedBy !== user.displayName) {
+            addNotif(`${t.completedBy} completed: "${t.text}"`, 'success');
+          }
+        });
+      }
+      
+      prevTasksRef.current = taskList;
+      setTasks(taskList);
+    });
+    
+    return () => unsubscribe();
+  }, [user]);
+
+  // Listen to work sessions
+  useEffect(() => {
+    if (!user) return;
+    
+    const sessionsRef = ref(db, `workSessions/${user.uid}`);
+    const unsubscribe = onValue(sessionsRef, (snapshot) => {
+      const data = snapshot.val();
+      const sessionList = data ? Object.entries(data).map(([id, session]) => ({ id, ...session })) : [];
+      setWorkSessions(sessionList);
+    });
+    
+    return () => unsubscribe();
+  }, [user]);
+
+  // Listen to team members
+  useEffect(() => {
+    const teamRef = ref(db, 'team');
+    const unsubscribe = onValue(teamRef, (snapshot) => {
+      const data = snapshot.val();
+      const members = data ? Object.values(data) : [];
+      setTeamMembers(members);
+    });
+    
+    return () => unsubscribe();
+  }, []);
+
+  // Timer logic
   useEffect(() => {
     let interval;
     if (timerRunning && !timerPaused) {
@@ -44,26 +134,38 @@ export default function TaskTracker() {
     return () => clearInterval(interval);
   }, [timerRunning, timerPaused]);
 
-  const loadWorkSessions = async () => {
+  // Update last seen periodically
+  useEffect(() => {
+    if (!user) return;
+    const interval = setInterval(() => {
+      const userRef = ref(db, `team/${user.uid}/lastSeen`);
+      set(userRef, Date.now());
+    }, 60000);
+    return () => clearInterval(interval);
+  }, [user]);
+
+  const signInWithGoogle = async () => {
     try {
-      const result = await window.storage.get('work-' + userName, false);
-      if (result && result.value) setWorkSessions(JSON.parse(result.value));
-    } catch (e) {
-      setWorkSessions([]);
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error('Sign in error:', error);
+      addNotif('Failed to sign in', 'error');
     }
   };
 
-  const saveWorkSessions = async (sessions) => {
+  const handleSignOut = async () => {
     try {
-      await window.storage.set('work-' + userName, JSON.stringify(sessions), false);
-    } catch (e) {}
+      await signOut(auth);
+    } catch (error) {
+      console.error('Sign out error:', error);
+    }
   };
 
   const formatTime = (sec) => {
     const h = Math.floor(sec / 3600);
     const m = Math.floor((sec % 3600) / 60);
     const s = sec % 60;
-    return h.toString().padStart(2, '0') + ':' + m.toString().padStart(2, '0') + ':' + s.toString().padStart(2, '0');
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
   const getWorkStats = () => {
@@ -88,12 +190,15 @@ export default function TaskTracker() {
     setTimerSeconds(0);
   };
 
-  const stopTimer = () => {
-    if (timerSeconds > 0) {
-      const session = { id: Date.now(), userName, duration: timerSeconds, date: new Date().toISOString(), dateStr: new Date().toISOString().split('T')[0] };
-      const updated = [...workSessions, session];
-      setWorkSessions(updated);
-      saveWorkSessions(updated);
+  const stopTimer = async () => {
+    if (timerSeconds > 0 && user) {
+      const sessionsRef = ref(db, `workSessions/${user.uid}`);
+      await push(sessionsRef, {
+        userName: user.displayName,
+        duration: timerSeconds,
+        date: new Date().toISOString(),
+        dateStr: new Date().toISOString().split('T')[0]
+      });
     }
     setTimerRunning(false);
     setTimerPaused(false);
@@ -106,82 +211,64 @@ export default function TaskTracker() {
     setTimeout(() => setNotifications(prev => prev.filter(x => x.id !== n.id)), 4000);
   };
 
-  const loadTasks = async () => {
-    try {
-      const result = await window.storage.get('tasks-v6', true);
-      if (result && result.value) {
-        const loaded = JSON.parse(result.value);
-        if (tasks.length > 0 && userName) {
-          const newTasks = loaded.filter(lt => !tasks.find(t => t.id === lt.id));
-          const newComps = loaded.filter(lt => {
-            const old = tasks.find(t => t.id === lt.id);
-            return old && !old.completed && lt.completed;
-          });
-          newTasks.forEach(t => { if (t.createdBy !== userName) addNotif(t.createdBy + ' added: "' + t.text + '"', 'info'); });
-          newComps.forEach(t => { if (t.completedBy !== userName) addNotif(t.completedBy + ' completed: "' + t.text + '"', 'success'); });
-        }
-        setTasks(loaded);
-      }
-    } catch (e) {
-      setTasks([]);
-    }
-  };
-
-  const saveTasks = async (updated) => {
-    try {
-      await window.storage.set('tasks-v6', JSON.stringify(updated), true);
-    } catch (e) {}
-  };
-
-  const addTask = () => {
-    if (!newTask.trim()) return;
-    const task = {
-      id: Date.now(), text: newTask, completed: false, category, priority,
+  const addTask = async () => {
+    if (!newTask.trim() || !user) return;
+    
+    const tasksRef = ref(db, 'tasks');
+    await push(tasksRef, {
+      text: newTask,
+      completed: false,
+      category,
+      priority,
       dueDate: dueDate || new Date().toISOString().split('T')[0],
-      createdAt: new Date().toISOString(), createdBy: userName, completedBy: null, completedAt: null
-    };
-    const updated = [...tasks, task];
-    setTasks(updated);
-    saveTasks(updated);
+      createdAt: new Date().toISOString(),
+      createdBy: user.displayName,
+      createdByUid: user.uid,
+      completedBy: null,
+      completedAt: null
+    });
+    
     setNewTask('');
     
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const parts = task.dueDate.split('-');
+    const parts = dueDate.split('-');
     const due = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
     due.setHours(0, 0, 0, 0);
     const days = Math.ceil((due - today) / (1000 * 60 * 60 * 24));
     
-    if (days === 0) addNotif('Task due TODAY: "' + task.text + '"', 'warning');
+    if (days === 0) addNotif('Task due TODAY!', 'warning');
     else if (days === 1) addNotif('Task created — due tomorrow', 'info');
-    else if (days > 1) addNotif('Task created — ' + days + ' days left', 'success');
+    else if (days > 1) addNotif(`Task created — ${days} days left`, 'success');
     else addNotif('Task is overdue!', 'error');
   };
 
-  const toggleTask = (id) => {
-    const updated = tasks.map(t => {
-      if (t.id === id) {
-        const completing = !t.completed;
-        if (completing) addNotif('Completed: "' + t.text + '"', 'success');
-        return { ...t, completed: completing, completedBy: completing ? userName : null, completedAt: completing ? new Date().toISOString() : null };
-      }
-      return t;
+  const toggleTask = async (id) => {
+    const task = tasks.find(t => t.id === id);
+    if (!task || !user) return;
+    
+    const completing = !task.completed;
+    const taskRef = ref(db, `tasks/${id}`);
+    await update(taskRef, {
+      completed: completing,
+      completedBy: completing ? user.displayName : null,
+      completedByUid: completing ? user.uid : null,
+      completedAt: completing ? new Date().toISOString() : null
     });
-    setTasks(updated);
-    saveTasks(updated);
+    
+    if (completing) addNotif(`Completed: "${task.text}"`, 'success');
   };
 
-  const deleteTask = (id) => {
-    const updated = tasks.filter(t => t.id !== id);
-    setTasks(updated);
-    saveTasks(updated);
+  const deleteTask = async (id) => {
+    const taskRef = ref(db, `tasks/${id}`);
+    await remove(taskRef);
   };
 
   const exportData = () => {
     const data = {
-      version: '1.0',
+      version: '2.0-firebase',
       exportedAt: new Date().toISOString(),
-      exportedBy: userName,
+      exportedBy: user?.displayName,
       tasks: tasks,
       workSessions: workSessions
     };
@@ -197,9 +284,9 @@ export default function TaskTracker() {
     addNotif('Data exported successfully!', 'success');
   };
 
-  const importData = (event) => {
+  const importData = async (event) => {
     const file = event.target.files[0];
-    if (!file) return;
+    if (!file || !user) return;
     
     const reader = new FileReader();
     reader.onload = async (e) => {
@@ -211,23 +298,16 @@ export default function TaskTracker() {
           return;
         }
         
-        // Merge tasks - add imported tasks that don't exist
-        const existingIds = new Set(tasks.map(t => t.id));
-        const newTasks = data.tasks.filter(t => !existingIds.has(t.id));
-        const mergedTasks = [...tasks, ...newTasks];
-        setTasks(mergedTasks);
-        await saveTasks(mergedTasks);
+        let importedCount = 0;
+        const tasksRef = ref(db, 'tasks');
         
-        // Merge work sessions if present
-        if (data.workSessions && Array.isArray(data.workSessions)) {
-          const existingSessionIds = new Set(workSessions.map(s => s.id));
-          const newSessions = data.workSessions.filter(s => !existingSessionIds.has(s.id));
-          const mergedSessions = [...workSessions, ...newSessions];
-          setWorkSessions(mergedSessions);
-          await saveWorkSessions(mergedSessions);
+        for (const task of data.tasks) {
+          const { id, ...taskData } = task;
+          await push(tasksRef, taskData);
+          importedCount++;
         }
         
-        addNotif(`Imported ${newTasks.length} tasks${data.workSessions ? ` and work sessions` : ''}`, 'success');
+        addNotif(`Imported ${importedCount} tasks`, 'success');
         setShowDataModal(false);
       } catch (err) {
         addNotif('Failed to parse backup file', 'error');
@@ -237,24 +317,13 @@ export default function TaskTracker() {
     event.target.value = '';
   };
 
-  const clearAllData = async () => {
-    if (confirm('Are you sure you want to clear all data? This cannot be undone.')) {
-      setTasks([]);
-      setWorkSessions([]);
-      await saveTasks([]);
-      await saveWorkSessions([]);
-      addNotif('All data cleared', 'warning');
-      setShowDataModal(false);
-    }
-  };
-
   const stats = {
     total: tasks.length,
     completed: tasks.filter(t => t.completed).length,
     pending: tasks.filter(t => !t.completed).length,
     todayPending: tasks.filter(t => t.dueDate === new Date().toISOString().split('T')[0] && !t.completed).length,
-    userCreated: tasks.filter(t => t.createdBy === userName).length,
-    userCompleted: tasks.filter(t => t.completedBy === userName).length
+    userCreated: tasks.filter(t => t.createdByUid === user?.uid).length,
+    userCompleted: tasks.filter(t => t.completedByUid === user?.uid).length
   };
 
   const progress = stats.total > 0 ? (stats.completed / stats.total) * 100 : 0;
@@ -265,6 +334,7 @@ export default function TaskTracker() {
     if (filter === 'active') return !t.completed;
     if (filter === 'completed') return t.completed;
     if (filter === 'today') return t.dueDate === new Date().toISOString().split('T')[0];
+    if (filter === 'mine') return t.createdByUid === user?.uid;
     return true;
   }).sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
 
@@ -277,32 +347,48 @@ export default function TaskTracker() {
     critical: 'bg-red-500/20 text-red-300 border-red-500/30'
   };
 
-  if (showNamePrompt) {
+  const getOnlineMembers = () => {
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    return teamMembers.filter(m => m.lastSeen > fiveMinutesAgo);
+  };
+
+  // Loading state
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
+        <div className="animate-spin w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full"></div>
+      </div>
+    );
+  }
+
+  // Login screen
+  if (!user) {
     return (
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
         <div className="absolute inset-0 bg-gradient-to-br from-indigo-500/10 via-transparent to-purple-500/10" />
-        <div className="relative bg-zinc-900/80 backdrop-blur-xl p-10 rounded-3xl border border-zinc-800 shadow-2xl max-w-md w-full">
-          <div className="w-16 h-16 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl flex items-center justify-center mb-6 shadow-lg shadow-indigo-500/25">
-            <Briefcase className="w-8 h-8 text-white" />
+        <div className="relative bg-zinc-900/80 backdrop-blur-xl p-10 rounded-3xl border border-zinc-800 shadow-2xl max-w-md w-full text-center">
+          <div className="w-20 h-20 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl flex items-center justify-center mb-6 mx-auto shadow-lg shadow-indigo-500/25">
+            <Zap className="w-10 h-10 text-white" />
           </div>
-          <h2 className="text-3xl font-bold text-white mb-2">Welcome</h2>
-          <p className="text-zinc-400 mb-8">Enter your name to start tracking tasks with your team.</p>
-          <input 
-            type="text" 
-            value={userName} 
-            onChange={(e) => setUserName(e.target.value)}
-            onKeyPress={(e) => { if (e.key === 'Enter' && userName.trim()) { localStorage.setItem('taskTrackerName', userName.trim()); setShowNamePrompt(false); } }}
-            placeholder="Your name"
-            className="w-full px-5 py-4 rounded-xl bg-zinc-800/50 border border-zinc-700 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent mb-4 text-lg transition-all"
-            autoFocus
-          />
+          <h1 className="text-3xl font-bold text-white mb-2">TaskFlow</h1>
+          <p className="text-zinc-400 mb-8">Collaborative task management for teams</p>
+          
           <button 
-            onClick={() => { if (userName.trim()) { localStorage.setItem('taskTrackerName', userName.trim()); setShowNamePrompt(false); } }}
-            disabled={!userName.trim()}
-            className="w-full px-5 py-4 bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-xl hover:from-indigo-600 hover:to-purple-700 transition-all font-semibold text-lg disabled:opacity-40 disabled:cursor-not-allowed shadow-lg shadow-indigo-500/25"
+            onClick={signInWithGoogle}
+            className="w-full px-5 py-4 bg-white text-zinc-900 rounded-xl hover:bg-zinc-100 transition-all font-semibold text-lg flex items-center justify-center gap-3 shadow-lg"
           >
-            Get Started
+            <svg className="w-6 h-6" viewBox="0 0 24 24">
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+            </svg>
+            Sign in with Google
           </button>
+          
+          <p className="text-zinc-500 text-sm mt-6">
+            Sign in to sync tasks with your team in real-time
+          </p>
         </div>
       </div>
     );
@@ -317,7 +403,7 @@ export default function TaskTracker() {
         {notifications.map(n => (
           <div 
             key={n.id} 
-            className={`px-4 py-3 rounded-xl shadow-xl backdrop-blur-xl border animate-in slide-in-from-right duration-300 ${
+            className={`px-4 py-3 rounded-xl shadow-xl backdrop-blur-xl border ${
               n.type === 'error' ? 'bg-red-500/90 border-red-400/50' : 
               n.type === 'warning' ? 'bg-amber-500/90 border-amber-400/50' : 
               n.type === 'success' ? 'bg-emerald-500/90 border-emerald-400/50' : 
@@ -467,27 +553,25 @@ export default function TaskTracker() {
               </div>
               <div>
                 <h2 className="text-xl font-bold text-white">Data Management</h2>
-                <p className="text-zinc-500 text-sm">Export, import, or clear your data</p>
+                <p className="text-zinc-500 text-sm">Export or import your data</p>
               </div>
             </div>
             
             <div className="space-y-4">
-              {/* Current Data Summary */}
               <div className="bg-zinc-800/50 rounded-2xl p-5 border border-zinc-700/50">
                 <p className="text-zinc-400 text-sm font-medium mb-3">Current Data</p>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <div className="text-2xl font-bold text-white">{tasks.length}</div>
-                    <div className="text-xs text-zinc-500">Tasks</div>
+                    <div className="text-xs text-zinc-500">Team Tasks</div>
                   </div>
                   <div>
                     <div className="text-2xl font-bold text-white">{workSessions.length}</div>
-                    <div className="text-xs text-zinc-500">Work Sessions</div>
+                    <div className="text-xs text-zinc-500">Your Sessions</div>
                   </div>
                 </div>
               </div>
 
-              {/* Export Button */}
               <button 
                 onClick={exportData}
                 className="w-full bg-gradient-to-r from-emerald-500 to-teal-600 text-white rounded-xl p-4 hover:from-emerald-600 hover:to-teal-700 transition-all flex items-center justify-center gap-3 font-semibold shadow-lg shadow-emerald-500/20"
@@ -496,7 +580,6 @@ export default function TaskTracker() {
                 Download Backup
               </button>
               
-              {/* Import Button */}
               <input
                 type="file"
                 ref={fileInputRef}
@@ -512,18 +595,59 @@ export default function TaskTracker() {
                 Import from Backup
               </button>
               
-              {/* Clear Data Button */}
-              <button 
-                onClick={clearAllData}
-                className="w-full bg-red-500/10 text-red-400 rounded-xl p-4 hover:bg-red-500/20 transition-all flex items-center justify-center gap-3 font-semibold border border-red-500/30"
-              >
-                <Trash2 className="w-5 h-5" />
-                Clear All Data
-              </button>
-              
               <p className="text-zinc-500 text-xs text-center mt-4">
-                Backups are saved as JSON files. Import merges data without duplicates.
+                Data syncs in real-time with your team via Firebase
               </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Team Modal */}
+      {showTeam && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-zinc-900 p-8 rounded-3xl border border-zinc-800 shadow-2xl max-w-md w-full relative">
+            <button onClick={() => setShowTeam(false)} className="absolute top-4 right-4 text-zinc-500 hover:text-white transition-colors">
+              <X className="w-6 h-6" />
+            </button>
+            <div className="flex items-center gap-3 mb-8">
+              <div className="w-12 h-12 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center">
+                <Users className="w-6 h-6 text-white" />
+              </div>
+              <div>
+                <h2 className="text-xl font-bold text-white">Team Members</h2>
+                <p className="text-zinc-500 text-sm">{getOnlineMembers().length} online now</p>
+              </div>
+            </div>
+            
+            <div className="space-y-3">
+              {teamMembers.map(member => {
+                const isOnline = member.lastSeen > Date.now() - 5 * 60 * 1000;
+                const isCurrentUser = member.uid === user.uid;
+                return (
+                  <div key={member.uid} className="flex items-center gap-3 p-3 bg-zinc-800/50 rounded-xl border border-zinc-700/50">
+                    <div className="relative">
+                      {member.photo ? (
+                        <img src={member.photo} alt={member.name} className="w-10 h-10 rounded-full" />
+                      ) : (
+                        <div className="w-10 h-10 rounded-full bg-indigo-500 flex items-center justify-center text-white font-semibold">
+                          {member.name?.charAt(0)}
+                        </div>
+                      )}
+                      <div className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-zinc-800 ${isOnline ? 'bg-emerald-500' : 'bg-zinc-500'}`} />
+                    </div>
+                    <div className="flex-1">
+                      <p className="text-white font-medium text-sm">
+                        {member.name} {isCurrentUser && <span className="text-zinc-500">(you)</span>}
+                      </p>
+                      <p className="text-zinc-500 text-xs">{member.email}</p>
+                    </div>
+                    <span className={`text-xs px-2 py-1 rounded-lg ${isOnline ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-400'}`}>
+                      {isOnline ? 'Online' : 'Offline'}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -539,11 +663,27 @@ export default function TaskTracker() {
             </div>
             <div>
               <h1 className="text-2xl font-bold text-white">TaskFlow</h1>
-              <p className="text-zinc-500 text-sm">Welcome back, <span className="text-indigo-400">{userName}</span></p>
+              <p className="text-zinc-500 text-sm">Welcome, <span className="text-indigo-400">{user.displayName}</span></p>
             </div>
           </div>
           
           <div className="flex items-center gap-2">
+            {/* Online indicator */}
+            <button onClick={() => setShowTeam(true)} className="flex items-center gap-2 px-3 py-2 bg-zinc-800/50 hover:bg-zinc-800 rounded-xl border border-zinc-700/50 transition-all">
+              <div className="flex -space-x-2">
+                {getOnlineMembers().slice(0, 3).map(m => (
+                  m.photo ? (
+                    <img key={m.uid} src={m.photo} alt={m.name} className="w-6 h-6 rounded-full border-2 border-zinc-800" />
+                  ) : (
+                    <div key={m.uid} className="w-6 h-6 rounded-full bg-indigo-500 border-2 border-zinc-800 flex items-center justify-center text-white text-xs font-semibold">
+                      {m.name?.charAt(0)}
+                    </div>
+                  )
+                ))}
+              </div>
+              <span className="text-emerald-400 text-sm font-medium">{getOnlineMembers().length} online</span>
+            </button>
+            
             <button onClick={() => setShowDataModal(true)} className="p-3 bg-zinc-800/50 hover:bg-zinc-800 rounded-xl border border-zinc-700/50 transition-all group">
               <Download className="w-5 h-5 text-zinc-400 group-hover:text-emerald-400 transition-colors" />
             </button>
@@ -553,9 +693,9 @@ export default function TaskTracker() {
             <button onClick={() => setShowStats(true)} className="p-3 bg-zinc-800/50 hover:bg-zinc-800 rounded-xl border border-zinc-700/50 transition-all group">
               <BarChart3 className="w-5 h-5 text-zinc-400 group-hover:text-purple-400 transition-colors" />
             </button>
-            <a href="https://mail.google.com/mail/u/0/#inbox" target="_blank" rel="noopener noreferrer" className="p-3 bg-zinc-800/50 hover:bg-zinc-800 rounded-xl border border-zinc-700/50 transition-all group">
-              <Mail className="w-5 h-5 text-zinc-400 group-hover:text-red-400 transition-colors" />
-            </a>
+            <button onClick={handleSignOut} className="p-3 bg-zinc-800/50 hover:bg-zinc-800 rounded-xl border border-zinc-700/50 transition-all group">
+              <LogOut className="w-5 h-5 text-zinc-400 group-hover:text-red-400 transition-colors" />
+            </button>
           </div>
         </header>
 
@@ -594,13 +734,13 @@ export default function TaskTracker() {
         {/* Progress */}
         <div className="bg-zinc-900/50 backdrop-blur rounded-2xl p-5 border border-zinc-800 mb-8">
           <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-medium text-zinc-400">Overall Progress</span>
+            <span className="text-sm font-medium text-zinc-400">Team Progress</span>
             <span className="text-sm font-bold text-white">{Math.round(progress)}%</span>
           </div>
           <div className="w-full bg-zinc-800 rounded-full h-2 overflow-hidden">
             <div 
               className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-700 ease-out rounded-full" 
-              style={{ width: progress + '%' }} 
+              style={{ width: `${progress}%` }} 
             />
           </div>
         </div>
@@ -659,7 +799,7 @@ export default function TaskTracker() {
 
         {/* Filter Tabs */}
         <div className="flex gap-2 mb-6 overflow-x-auto pb-2">
-          {['all', 'active', 'today', 'completed'].map(f => (
+          {['all', 'active', 'today', 'mine', 'completed'].map(f => (
             <button
               key={f}
               onClick={() => setFilter(f)}
@@ -669,7 +809,7 @@ export default function TaskTracker() {
                   : 'bg-zinc-800/50 text-zinc-400 hover:text-white hover:bg-zinc-800'
               }`}
             >
-              {f.charAt(0).toUpperCase() + f.slice(1)}
+              {f === 'mine' ? 'My Tasks' : f.charAt(0).toUpperCase() + f.slice(1)}
               {f === 'today' && stats.todayPending > 0 && (
                 <span className="ml-2 px-2 py-0.5 bg-white/20 rounded-full text-xs">{stats.todayPending}</span>
               )}
@@ -753,7 +893,7 @@ export default function TaskTracker() {
         </div>
         
         <p className="text-center text-zinc-600 text-sm mt-8">
-          TaskFlow • Collaborative task management
+          TaskFlow • Real-time collaborative task management
         </p>
       </div>
     </div>
